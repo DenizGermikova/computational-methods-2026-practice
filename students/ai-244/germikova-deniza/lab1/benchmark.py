@@ -1,87 +1,232 @@
-import time
-import statistics
+
+"""ЛР №1: три прогони з медіаною для однієї обраної моделі."""
+
+import argparse
 import csv
+import statistics
+import time
+from pathlib import Path
 from providers import make_client
 
+FILE = Path(__file__).with_name("results.csv")
 
-def measure(client, model, prompt):
-    """Вимірює TTFT, загальний час і швидкість відповіді."""
-    start = time.perf_counter()
-    first_token_at = None
-    parts = []
-
-    stream = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        stream=True,
-    )
-
-    for chunk in stream:
-        if not chunk.choices:
-            continue
-
-        piece = chunk.choices[0].delta.content
-
-        if piece:
-            if first_token_at is None:
-                first_token_at = time.perf_counter()
-            parts.append(piece)
-
-    end = time.perf_counter()
-    text = "".join(parts)
-    total = end - start
-
-    return {
-        "ttft_s": round(first_token_at - start, 3)
-        if first_token_at is not None else total,
-        "total_s": round(total, 3),
-        "chars": len(text),
-        "chars_per_s": round(len(text) / total, 1)
-        if total > 0 else 0,
-    }
-
+FIELDS = [
+    "provider", "model", "prompt",
+    "ttft_s", "total_s", "chars_per_s"
+]
 
 PROMPTS = {
     "short": "Столиця Японії?",
     "medium": "Поясни в одному абзаці, що таке рекурсія.",
     "long": (
-        "Напиши інструкцію з 10 пунктів, як налаштувати "
-        "робоче середовище розробника."
+        "Напиши інструкцію з 10 пунктів, "
+        "як налаштувати робоче середовище розробника."
     ),
 }
 
-rows = []
+MODELS = {
+    "llama": "llama3.2:3b",
+    "qwen": "qwen3:4b",
+    "cloud": "gemini-3.5-flash-lite",
+}
 
-for provider in ["local", "cloud"]:
-    client, model = make_client(provider)
 
-    # Прогрів: результат не враховуємо
-    measure(client, model, "Тестовий запит для прогріву.")
+def measure(client, model, prompt):
+    start = time.perf_counter()
+    first = None
+    chunks = []
 
-    for name, prompt in PROMPTS.items():
-        runs = [measure(client, model, prompt) for _ in range(3)]
+    stream = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "user", "content": prompt}
+        ],
+        stream=True,
+    )
 
-        result = {
-            "provider": provider,
-            "model": model,
-            "prompt": name,
-            "ttft_s": statistics.median(
-                r["ttft_s"] for r in runs
-            ),
-            "total_s": statistics.median(
-                r["total_s"] for r in runs
-            ),
-            "chars_per_s": statistics.median(
-                r["chars_per_s"] for r in runs
-            ),
-        }
+    for part in stream:
+        if not part.choices:
+            continue
 
-        rows.append(result)
-        print(result)
+        value = part.choices[0].delta.content
 
-with open("results.csv", "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-    writer.writeheader()
-    writer.writerows(rows)
+        if value:
+            if first is None:
+                first = time.perf_counter()
+            chunks.append(value)
 
-print("\nРезультати збережено у файлі results.csv")
+    total = time.perf_counter() - start
+    text = "".join(chunks)
+
+    if not text:
+        raise ValueError(
+            "Не отримано текстової відповіді"
+        )
+
+    return {
+        "ttft_s": first - start,
+        "total_s": total,
+        "chars_per_s": len(text) / total,
+    }
+
+
+def save_row(row):
+    old = []
+
+    if FILE.exists():
+        with FILE.open(
+            "r", encoding="utf-8", newline=""
+        ) as f:
+            old = list(csv.DictReader(f))
+
+    old = [
+        r for r in old
+        if not (
+            r.get("model") == row["model"]
+            and r.get("prompt") == row["prompt"]
+        )
+    ]
+
+    old.append(row)
+
+    with FILE.open(
+        "w", encoding="utf-8", newline=""
+    ) as f:
+        writer = csv.DictWriter(
+            f, fieldnames=FIELDS
+        )
+        writer.writeheader()
+        writer.writerows(old)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--model",
+        required=True,
+        choices=MODELS
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true"
+    )
+
+    args = parser.parse_args()
+    name = MODELS[args.model]
+
+    print(
+        f"Модель: {name}; "
+        "1 прогрів + 3 повтори × 3 промпти"
+    )
+
+    if args.dry_run:
+        print(
+            "DRY RUN OK: запитів немає; "
+            "results.csv не змінено"
+        )
+        return
+
+    provider = (
+        "cloud" if args.model == "cloud"
+        else "local"
+    )
+
+    client, _ = make_client(provider)
+
+    try:
+        measure(
+            client,
+            name,
+            "Тестовий запит для прогріву."
+        )
+
+        for short, prompt in PROMPTS.items():
+            samples = [
+                measure(client, name, prompt)
+                for _ in range(3)
+            ]
+
+            row = {
+                "provider": provider,
+                "model": name,
+                "prompt": short
+            }
+
+            for metric in (
+                "ttft_s",
+                "total_s",
+                "chars_per_s"
+            ):
+                row[metric] = round(
+                    statistics.median(
+                        x[metric] for x in samples
+                    ),
+                    3
+                )
+
+            save_row(row)
+
+            print(
+                f"{short}: "
+                f"TTFT={row['ttft_s']} с, "
+                f"загалом={row['total_s']} с, "
+                f"симв/с={row['chars_per_s']}"
+            )
+
+        if args.model == "cloud":
+            with FILE.open(
+                "r", encoding="utf-8", newline=""
+            ) as f:
+                rows = list(csv.DictReader(f))
+
+            rows = [
+                r for r in rows
+                if r.get("model") != "gemini-3.8-flash"
+            ]
+
+            with FILE.open(
+                "w", encoding="utf-8", newline=""
+            ) as f:
+                writer = csv.DictWriter(
+                    f, fieldnames=FIELDS
+                )
+                writer.writeheader()
+                writer.writerows(rows)
+
+            print(
+                "Старі неповні виміри Gemini 3.8 "
+                "вилучено з results.csv"
+            )
+
+    except KeyboardInterrupt:
+        print(
+            "\nЗупинено. Уже записані рядки збережені"
+        )
+
+    except Exception as exc:
+        status = getattr(
+            exc, "status_code", None
+        )
+
+        if (
+            status == 429
+            or "RESOURCE_EXHAUSTED" in str(exc)
+        ):
+            print(
+                "Помилка 429: ліміт Google. "
+                "Недостовірних чисел не записуємо"
+            )
+        else:
+            print(
+                f"Помилка вимірювання: "
+                f"{type(exc).__name__} (HTTP {status})"
+            )
+
+        print(
+            "Повтори запуск після усунення проблеми"
+        )
+
+
+if __name__ == "__main__":
+    main()
